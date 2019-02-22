@@ -10,6 +10,7 @@ import tempfile
 import os
 import re
 import itertools
+import json
 try:
     from StringIO import StringIO
 except ImportError:
@@ -23,12 +24,11 @@ import pandas as pd
 
 from pugnlp.futil import find_files
 from pugnlp.regexes import cre_url
-from annoy import AnnoyIndex
 
-from nlpia.constants import logging
+from nlpia.constants import logging, DATA_PATH, BOOK_PATH
 from nlpia.constants import UTF8_TO_ASCII, UTF8_TO_MULTIASCII
-from nlpia.constants import BASE_DIR, DATA_PATH, BIGDATA_PATH, BOOK_PATH  # noqa
-from nlpia.data.loaders import read_csv
+from nlpia.data.loaders import read_csv, read_text
+from nlpia.futil import find_filepath, ensure_open, read_json
 
 
 np = pd.np
@@ -80,25 +80,25 @@ def prepend_http(url):
     return url
 
 
-def is_valid_url(url, allow_redirects=False, timeout=5):
-    """ Check URL to see if it is a valid web page, return the redirected location if it is
+def is_up_url(url, allow_redirects=False, timeout=5):
+    r""" Check URL to see if it is a valid web page, return the redirected location if it is
 
     Returns:
       None if ConnectionError
       False if url is invalid (any HTTP error code)
       cleaned up URL (following redirects and possibly adding HTTP schema "http://")
 
-    >> is_valid_url("totalgood.org")
+    >> is_up_url("totalgood.org")
     'https://totalgood.org'
 
-    >>> url = is_valid_url("totalgood.org")
-    >>> url is None or url.startswith('http')
+    >>> is_up_url("duckduckgo.com")  # best search engine in the world!
+    'https://duckduckgo.com/'
+    >>> urlisup = is_up_url("wikipedia.org")
+    >>> str(urlisup).startswith('http')
     True
-    >>> url.endswith('totalgood.org')
+    >>> 'wikipedia.org' in str(urlisup)
     True
-    >>> is_valid_url('abcd')
-    False
-    >>> bool(is_valid_url('abcd.com'))
+    >>> is_up_url('invalidurlwithoutadomain')
     False
     """
     if not isinstance(url, basestring) or '.' not in url:
@@ -112,12 +112,72 @@ def is_valid_url(url, allow_redirects=False, timeout=5):
         return None
     except:
         return None
-    if resp.status_code == 200:
+    if resp.status_code in (301, 302, 307) or resp.headers.get('location', None):
+        return resp.headers.get('location', None)  # return redirected URL
+    elif 100 <= resp.status_code < 400:
         return normalized_url  # return the original URL that was requested/visited
-    elif resp.status_code == 302:
-        return resp.headers['location']  # return redirected URL
     else:
         return False
+
+
+def get_markdown_levels(lines, levels=set((0, 1, 2, 3, 4, 5, 6))):
+    r""" Return a list of 2-tuples with a level integer for the heading levels
+
+    >>> get_markdown_levels('paragraph \n##bad\n# hello\n  ### world\n')
+    [(0, 'paragraph '), (2, 'bad'), (0, '# hello'), (3, 'world')]
+    >>> get_markdown_levels('- bullet \n##bad\n# hello\n  ### world\n')
+    [(0, '- bullet '), (2, 'bad'), (0, '# hello'), (3, 'world')]
+
+    FIXME:
+    >>> get_markdown_levels('- bullet \n##bad\n# hello\n  ### world\n', 1)
+    []
+    """
+    if isinstance(levels, (int, float, basestring, str, bytes)):
+        levels = set([int(float(levels))])
+    else:
+        levels = set([int(i) for i in levels])
+    if isinstance(lines, basestring):
+        lines = lines.splitlines()
+    level_lines = []
+    for line in lines:
+        level_line = None
+        if 0 in levels:
+            level_line = (0, line)
+        for i in range(6, 1, -1):
+            if line.lstrip().startswith('#' * i):
+                level_line = (i, line.lstrip()[i:].lstrip())
+                break
+        if level_line is not None and level_line[0] in levels:
+            level_lines.append(level_line)
+    return level_lines
+
+
+def read_http_status_codes(filename='HTTP_1.1  Status Code Definitions.html'):
+    """ Parse the HTTP documentation HTML page in filename
+    
+    Return:
+        code_dict: {200: "OK", ...}
+    """ 
+    lines = read_text(filename)
+    level_lines = get_markdown_levels(lines)
+    code_dict = {}
+    for level, line in level_lines:
+        code, name = (re.findall(r'\s(\d\d\d)[\W]+([-\w\s]*)', line) or [[0, '']])[0]
+        if 1000 > int(code) >= 100:
+            code_dict[code] = name
+            code_dict[int(code)] = name
+    return code_dict
+    # json.dump(code_dict, open(os.path.join(DATA_PATH, fn + '.json'), 'wt'), indent=2)
+
+
+def http_status_code(code):
+    """ convert 3-digit integer into a short name of the response status code for an HTTP request
+    
+    >>> http_status_code(301)
+
+    """
+    code_dict = read_json(os.path.join(DATA_PATH, 'HTTP_1.1  Status Code Definitions.html.json'))
+    return code_dict.get(code, None)
 
 
 def looks_like_url(url):
@@ -167,7 +227,7 @@ def iter_lines(url_or_text, ext=None, mode='rt'):
         if os.path.isdir(url_or_text):
             filepaths = [filemeta['path'] for filemeta in find_files(url_or_text, ext=ext)]
             return itertools.chain.from_iterable(map(open, filepaths))
-        url = is_valid_url(url_or_text)
+        url = is_up_url(url_or_text)
         if url:
             for i in range(3):
                 return requests.get(url, stream=True, allow_redirects=True, timeout=5)
@@ -290,58 +350,3 @@ def clean_df(df, header=None, **read_csv_kwargs):
         df[col] = df[col].apply(unicode2ascii)
     return df
 
-
-def representative_sample(X, num_samples, save=False):
-    """Sample vectors in X, prefering edge cases and vectors farthest from other vectors in sample set
-
-
-    """
-    X = X.values if hasattr(X, 'values') else np.array(X)
-    N, M = X.shape
-    rownums = np.arange(N)
-    np.random.shuffle(rownums)
-
-    idx = AnnoyIndex(M)
-    for i, row in enumerate(X):
-        idx.add_item(i, row)
-    idx.build(int(np.log2(N)) + 1)
-
-    if save:
-        if isinstance(save, basestring):
-            idxfilename = save
-        else:
-            idxfile = tempfile.NamedTemporaryFile(delete=False)
-            idxfile.close()
-            idxfilename = idxfile.name
-        idx.save(idxfilename)
-        idx = AnnoyIndex(M)
-        idx.load(idxfile.name)
-
-    samples = -1 * np.ones(shape=(num_samples,), dtype=int)
-    samples[0] = rownums[0]
-    # FIXME: some integer determined by N and num_samples and distribution
-    j, num_nns = 0, min(1000, int(num_samples / 2. + 1))
-    for i in rownums:
-        if i in samples:
-            continue
-        nns = idx.get_nns_by_item(i, num_nns)
-        # FIXME: pick vector furthest from past K (K > 1) points or outside of a hypercube
-        #        (sized to uniformly fill the space) around the last sample
-        samples[j + 1] = np.setdiff1d(nns, samples)[-1]
-        if len(num_nns) < num_samples / 3.:
-            num_nns = min(N, 1.3 * num_nns)
-        j += 1
-    return samples
-
-
-def find_data_path(path):
-    for fullpath in [path,
-                     os.path.join(DATA_PATH, path),
-                     os.path.join(BIGDATA_PATH, path),
-                     os.path.join(BASE_DIR, path),
-                     os.path.expanduser(os.path.join('~', path)),
-                     os.path.abspath(os.path.join('.', path))
-                     ]:
-        if os.path.exists(fullpath):
-            return fullpath
-    return None

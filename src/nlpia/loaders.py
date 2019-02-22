@@ -52,6 +52,7 @@ from requests.exceptions import ConnectionError, InvalidURL, InvalidSchema, Inva
 from urllib.parse import urlparse
 from urllib.error import URLError
 from lxml.html import fromstring as parse_html
+from html2text import html2text
 from copy import deepcopy, copy
 
 import pandas as pd
@@ -67,16 +68,15 @@ from gensim.scripts.glove2word2vec import glove2word2vec
 
 from pugnlp.futil import mkdir_p, path_status, find_files
 from pugnlp.util import clean_columns
+
 from nlpia.constants import DATA_PATH, BIGDATA_PATH
 from nlpia.constants import DATA_INFO_FILE, BIGDATA_INFO_FILE, BIGDATA_INFO_LATEST
+from nlpia.constants import INT_MIN, INT_NAN, MAX_LEN_FILEPATH, MIN_DATA_FILE_SIZE
+from nlpia.constants import HTML_TAGS, EOL
+from nlpia.futil import find_filepath, expand_filepath, ensure_open, read_json
 
 _parse = None  # placeholder for SpaCy parser + language model
 
-INT_MAX = INT64_MAX = 2 ** 63 - 1
-INT_MIN = INT64_MIN = - 2 ** 63
-INT_NAN = INT64_NAN = INT64_MIN
-INT_MIN = INT64_MIN = INT64_MIN + 1
-MIN_DATA_FILE_SIZE = 100  # get_data will fail on files < 100 bytes
 
 np = pd.np
 logger = logging.getLogger(__name__)
@@ -309,6 +309,12 @@ BIG_URLS = {
         'https://www.dropbox.com/s/5543bkihxflzry9/dialog.csv.gz?dl=1',
         4415234,
     ),
+    'cornellmovies': (
+        'http://www.cs.cornell.edu/~cristian/data/cornell_movie_dialogs_corpus.zip',
+        9916637,
+        'cornell_movie_dialogs_corpus',
+        
+    ),
     'save_dialog_tweets': (
         'https://www.dropbox.com/s/tlrr9bm45uzm9yl/save_dialog_tweets.txt.gz?dl=1',
         4517000,
@@ -318,7 +324,6 @@ BIG_URLS = {
         3112841563,
     ),
     'lsa_tweets_pickle': (
-        'https://www.dropbox.com/s/7k0nvl2dx3hsbqp/lsa_tweets_5589798_2003588x200.pkl.projection.u.npy?dl=0'
         'https://www.dropbox.com/s/7k0nvl2dx3hsbqp/lsa_tweets_5589798_2003588x200.pkl.projection.u.npy?dl=1',
         2900000000,
     ),
@@ -359,6 +364,9 @@ for yr in range(2011, 2017):
 
 
 # Aliases for bigurls. Canonical name given on line by itself.
+BIG_URLS['cornell'] = BIG_URLS['cornellmoviedialog'] = BIG_URLS['cornellmoviedialogs'] = BIG_URLS['cornell_movie_dialog'] = \
+    BIG_URLS['cornell_movie_dialogs'] = BIG_URLS['cornell_movie_dialog_corpus'] = BIG_URLS['cornell_movie_dialogs_corpus'] = \
+    BIG_URLS['cornellmovies']
 BIG_URLS['word2vec'] = BIG_URLS['wv'] = \
     BIG_URLS['w2v']
 BIG_URLS['glove'] = BIG_URLS['glovesm'] = BIG_URLS['glove-sm'] = BIG_URLS['glove_sm'] = BIG_URLS['glove-small'] = \
@@ -401,13 +409,23 @@ BIG_URLS.update(generate_big_urls_glove())
 ANKI_LANGUAGES = 'afr arq ara aze eus bel ben ber bul yue cat cbk cmn chv hrv ces dan nld est fin fra glg kat ' \
                  'deu ell heb hin hun isl ind ita jpn kha khm kor lvs lit nds mkd zsm mal mri mar max nob pes ' \
                  'pol por ron rus srp slk slv spa swe tgl tam tat tha tur ukr urd uig vie'.split()
+ANKI_LANGUAGE_SYNONYMS = list(zip('fre esp ger french spanish german turkish turkey dut dutch'.split(),
+                                  'fra spa deu fra    spa     deu    tur     tur    dan dan'.split()))
 LANG2ANKI = dict((lang[:2], lang) for lang in ANKI_LANGUAGES)
 """
 >>> len(ANKI_LANGUAGES) - len(LANG2ANKI)
 9
 """
+ENGLISHES = 'eng usa us bri british american aus australian'.split()
 for lang in ANKI_LANGUAGES:
-    BIG_URLS[lang] = ('http://www.manythings.org/anki/{}-eng.zip'.format(lang), 1000, '{}-eng'.format(lang), load_anki_df)
+    for eng in ENGLISHES:
+        BIG_URLS[lang] = ('http://www.manythings.org/anki/{}-eng.zip'.format(lang), 1000, '{}-{}'.format(lang, eng), load_anki_df)
+        BIG_URLS[lang + '-eng'] = ('http://www.manythings.org/anki/{}-eng.zip'.format(lang), 1000, '{}-{}'.format(lang, eng), load_anki_df)
+
+for syn, lang in ANKI_LANGUAGE_SYNONYMS:
+    BIG_URLS[syn] = BIG_URLS[lang]
+    for eng in ENGLISHES:
+        BIG_URLS[lang + '-' + eng] = BIG_URLS[lang + '-eng']
 
 """
 Google N-Gram Viewer meta data is from:
@@ -425,7 +443,7 @@ for name in GOOGLE_NGRAM_NAMES:
                                          {'sep': '\t', 'header': None, 'names': 'term_pos year term_freq book_freq'.split()})
 try:
     BIGDATA_INFO = pd.read_csv(BIGDATA_INFO_FILE, header=0)
-    logger.warning('Found BIGDATA index in {default} so it will overwrite nlpia.loaders.BIGDATA_URLS !!!'.format(
+    logger.warning('Found BIGDATA index in {default} so it will overwrite nlpia.loaders.BIG_URLS !!!'.format(
         default=BIGDATA_INFO_FILE))
 except (IOError, pd.errors.EmptyDataError):
     BIGDATA_INFO = pd.DataFrame(columns='name url file_size'.split())
@@ -712,54 +730,6 @@ def read_csv(*args, **kwargs):
     return df
 
 
-def ensure_open(f, mode='r'):
-    r""" Return a file pointer using gzip.open if filename ends with .gz otherwise open()
-
-    TODO: try to read a gzip rather than relying on gz extension, likewise for zip and other formats
-    TODO: monkey patch the file so that .write_bytes=.write and .write writes both str and bytes
-
-    >>> fn = os.path.join(DATA_PATH, 'pointcloud.csv.gz')
-    >>> fp = ensure_open(fn)
-    >>> fp
-    <gzip _io.BufferedReader name='...src/nlpia/data/pointcloud.csv.gz' 0x...>
-    >>> fp.closed
-    False
-    >>> with fp:
-    ...     print(len(fp.readlines()))
-    48485
-    >>> fp.read()
-    Traceback (most recent call last):
-      ...
-    ValueError: I/O operation on closed file
-    >>> len(ensure_open(fp).readlines())
-    48485
-    >>> fn = os.path.join(DATA_PATH, 'mavis-batey-greetings.txt')
-    >>> fp = ensure_open(fn)
-    >>> len(fp.read())
-    314
-    >>> len(fp.read())
-    0
-    >>> len(ensure_open(fp).read())
-    0
-    >>> fp.close()
-    >>> len(fp.read())
-    Traceback (most recent call last):
-      ...
-    ValueError: I/O operation on closed file.
-    """
-    if not hasattr(f, 'seek') or not hasattr(f, 'readlines'):
-        if f.lower().endswith('.gz'):
-            return gzip.open(f, mode=mode)
-        else:
-            return open(f, mode=mode)
-    elif f.closed:
-        if hasattr(f, '_write_gzip_header'):
-            return gzip.open(f.name, mode=mode)
-        else:
-            return open(f.name, mode=mode)
-    return f
-
-
 #######################################################################
 # Populate some local string variables with text files from DATA_PATH
 for filename in TEXTS:
@@ -805,11 +775,11 @@ def ensure_str(s):
     return repr(s)  # create a python repr (str) of a non-bytes nonstr object
 
 
-def read_txt(forfn, nrows=None, verbose=True):
+def read_text(forfn, nrows=None, verbose=True):
     r""" Read all the lines (up to nrows) from a text file or txt.gz file
 
     >>> fn = os.path.join(DATA_PATH, 'mavis-batey-greetings.txt')
-    >>> len(read_txt(fn, nrows=3))
+    >>> len(read_text(fn, nrows=3))
     3
     """
     tqdm_prog = tqdm if verbose else no_tqdm
@@ -826,7 +796,13 @@ def read_txt(forfn, nrows=None, verbose=True):
             if all(i == num_tabs[0] for i in num_tabs):
                 f.seek(0)
                 return read_csv(f, sep='\t', header=None, nrows=nrows)
+        elif sum((1 for line in lines if any((tag.lower() in line.lower() for tag in HTML_TAGS)))
+                ) / float(len(lines)) > .05:
+            return np.array(html2text(EOL.join(lines)).split(EOL))
     return lines
+
+
+read_txt = read_text
 
 
 for filename in CSVS:
@@ -835,21 +811,16 @@ for filename in CSVS:
 
 
 def no_tqdm(it, total=1, **kwargs):
+    """ Do-nothing iterable wrapper to subsitute for tqdm when verbose==False """
     return it
 
 
-def expand_filepath(filepath):
-    """ Expand any '~', '.', '*' variables in filepath.
-
-    See also: pugnlp.futil.expand_path
-
-    >>> len(expand_filepath('~')) > 3
-    True
-    """
-    return os.path.abspath(os.path.expandvars(os.path.expanduser(filepath)))
-
-
 def dropbox_basename(url):
+    """ Strip off the dl=0 suffix from dropbox links
+    
+    >>> dropbox_basename('https://www.dropbox.com/s/yviic64qv84x73j/aclImdb_v1.tar.gz?dl=1')
+    'aclImdb_v1.tar.gz'
+    """
     filename = os.path.basename(url)
     match = re.findall(r'\?dl=[0-9]$', filename)
     if match:
@@ -1036,19 +1007,19 @@ def create_big_url(name):
 def try_parse_url(url):
     """ User urlparse to try to parse URL returning None on exception """
     if len(url.strip()) < 4:
-        logger.error('Invalid URL: {}'.format(url))
+        logger.info('URL too short: {}'.format(url))
         return None
     try:
         parsed_url = urlparse(url)
     except ValueError:
-        logger.info('Invalid URL: {}'.format(url))
+        logger.info('Parse URL ValueError: {}'.format(url))
         return None
     if parsed_url.scheme:
         return parsed_url
     try:
         parsed_url = urlparse('http://' + parsed_url.geturl())
     except ValueError:
-        logger.info('Invalid URL: urlparse("{}") from "{}" '.format('http://' + parsed_url.geturl(), url))
+        logger.info('Invalid URL for assumed http scheme: urlparse("{}") from "{}" '.format('http://' + parsed_url.geturl(), url))
         return None
     if not parsed_url.scheme:
         logger.info('Unable to guess a scheme for URL: {}'.format(url))
@@ -1144,7 +1115,7 @@ def download_unzip(names=None, normalize_filenames=False, verbose=True):
     Also looks
 
     If names or [names] is a valid URL then download it and create a name
-        from the url in BIGDATA_URLS (not yet pushed to data_info.csv)
+        from the url in BIG_URLS (not yet pushed to data_info.csv)
     """
     names = [names] if isinstance(names, (str, basestring)) else names
     # names = names or list(BIG_URLS.keys())  # download them all, if none specified!
@@ -1433,11 +1404,6 @@ def multifile_dataframe(paths=['urbanslang{}of4.csv'.format(i) for i in range(1,
     return df
 
 
-def read_json(filepath):
-    filepath = expand_filepath(filepath)
-    return json.load(ensure_open(filepath, mode='rt'))
-
-
 def get_wikidata_qnum(wikiarticle, wikisite):
     """Retrieve the Query number for a wikidata database of metadata about a particular article
 
@@ -1603,6 +1569,34 @@ def load_geo_adwords(filename='AdWords API Location Criteria 2017-06-26.csv.gz')
     df['country'] = cleancanon.country
     return df
 
+def clean_cornell_movies(filename='cornell_movie_dialogs_corpus.zip', subdir='cornell movie-dialogs corpus'):
+    """ Load a dataframe of ~100k raw (uncollated) movie lines from the cornell movies dialog corpus
+    
+    >>> local_filepath = download_file(BIG_URLS['cornell_movie_dialogs_corpus'][0])
+    >>> df = clean_cornell_movies(filename='cornell_movie_dialogs_corpus.zip')
+    >>> df.describe(include='all')
+              user   movie  person utterance
+    count   304713  304713  304713    304446
+    unique    9035     617    5356    265783
+    top      u4525    m289    JACK     What?
+    freq       537    1530    3032      1684
+    """
+    fullpath_zipfile = find_filepath(filename)
+    dirname = os.path.basename(filename)
+    subdir = 'cornell movie-dialogs corpus'
+    if fullpath_zipfile.lower().endswith('.zip'):
+        retval = unzip(fullpath_zipfile)
+        dirname = dirname[:-4]
+    fullpath_movie_lines = os.path.join(BIGDATA_PATH, dirname, subdir, 'movie_lines.txt')
+    dialog = pd.read_csv(
+        fullpath_movie_lines, sep=r'\+\+\+\$\+\+\+', engine='python', header=None, index_col=0)
+    dialog.columns = 'user movie person utterance'.split()
+    dialog.index.name = 'line'
+    dialog.index = [int(s.strip()[1:]) for s in dialog.index.values]
+    dialog.sort_index(inplace=True)
+    for col in dialog.columns:
+        dialog[col] = dialog[col].str.strip()
+    return dialog
 
 def isglove(filepath):
     """ Get the first word vector in a GloVE file and return its dimensionality or False if not a vector
