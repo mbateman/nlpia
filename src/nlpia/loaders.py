@@ -49,36 +49,33 @@ from math import ceil
 from itertools import product, zip_longest
 import requests
 from requests.exceptions import ConnectionError, InvalidURL, InvalidSchema, InvalidHeader, MissingSchema
-from urllib.parse import urlparse
 from urllib.error import URLError
-from lxml.html import fromstring as parse_html
-from html2text import html2text
 from copy import deepcopy, copy
 
 import pandas as pd
 import gzip
 import tarfile
 import ftplib
-
 import spacy
-from tqdm import tqdm
 from gensim.models import KeyedVectors
 from gensim.models.keyedvectors import REAL, Vocab
 from gensim.scripts.glove2word2vec import glove2word2vec
-
-from pugnlp.futil import mkdir_p, path_status, find_files
 from pugnlp.util import clean_columns
 
 from nlpia.constants import DATA_PATH, BIGDATA_PATH
 from nlpia.constants import DATA_INFO_FILE, BIGDATA_INFO_FILE, BIGDATA_INFO_LATEST
 from nlpia.constants import INT_MIN, INT_NAN, MAX_LEN_FILEPATH, MIN_DATA_FILE_SIZE
 from nlpia.constants import HTML_TAGS, EOL
-from nlpia.futil import find_filepath, expand_filepath, ensure_open, read_json
+from nlpia.constants import tqdm, no_tqdm
+from nlpia.futil import mkdir_p, path_status, find_files  # from pugnlp.futil
+from nlpia.futil import find_filepath, expand_filepath, normalize_filepath, normalize_ext, ensure_open
+from nlpia.futil import read_json, read_text, read_csv
+from nlpia.web import get_url_filemeta, get_url_title, try_parse_url, dropbox_basename, dropbox_basename
 
 _parse = None  # placeholder for SpaCy parser + language model
 
-
 np = pd.np
+
 logger = logging.getLogger(__name__)
 # logging.config.dictConfig(LOGGING_CONFIG)
 # # doesn't display line number, etc
@@ -427,6 +424,7 @@ for syn, lang in ANKI_LANGUAGE_SYNONYMS:
     for eng in ENGLISHES:
         BIG_URLS[lang + '-' + eng] = BIG_URLS[lang + '-eng']
 
+
 """
 Google N-Gram Viewer meta data is from:
 * [GOOGLE_NGRAM files](https://storage.googleapis.com/books/ngrams/books/datasetsv2.html)
@@ -441,6 +439,7 @@ for name in GOOGLE_NGRAM_NAMES:
                                          1000, GOOGLE_NGRAM_FILE.format(name),
                                          pd.read_table,
                                          {'sep': '\t', 'header': None, 'names': 'term_pos year term_freq book_freq'.split()})
+
 try:
     BIGDATA_INFO = pd.read_csv(BIGDATA_INFO_FILE, header=0)
     logger.warning('Found BIGDATA index in {default} so it will overwrite nlpia.loaders.BIG_URLS !!!'.format(
@@ -605,27 +604,6 @@ def combine_dfs(dfs, index_col='index0 index1 index2'.split()):
         dfs = list(dfs.values())
 
 
-def looks_like_index(series, index_names=('Unnamed: 0', 'pk', 'index', '')):
-    """ Tries to infer if the Series (usually leftmost column) should be the index_col
-
-    >>> looks_like_index(pd.Series(np.arange(100)))
-    True
-    """
-    if series.name in index_names:
-        return True
-    if (series == series.index.values).all():
-        return True
-    if (series == np.arange(len(series))).all():
-        return True
-    if (
-        (series.index == np.arange(len(series))).all() and
-        str(series.dtype).startswith('int') and
-        (series.count() == len(series))
-    ):
-        return True
-    return False
-
-
 def get_longest_table(url='https://www.openoffice.org/dev_docs/source/file_extensions.html', header=0):
     """ Retrieve the HTML tables from a URL and return the longest DataFrame found
 
@@ -699,37 +677,6 @@ def get_filename_extensions(url='https://www.webopedia.com/quick_ref/fileextensi
     return df
 
 
-def read_csv(*args, **kwargs):
-    """Like pandas.read_csv, only little smarter: check left column to see if it should be the index_col
-
-    >>> read_csv(os.path.join(DATA_PATH, 'mavis-batey-greetings.csv')).head()
-                                                    sentence  is_greeting
-    0     It was a strange little outfit in the cottage.            0
-    1  Organisation is not a word you would associate...            0
-    2  When I arrived, he said: "Oh, hello, we're bre...            0
-    3                                       That was it.            0
-    4                I was never really told what to do.            0
-    """
-    kwargs.update({'low_memory': False})
-    if isinstance(args[0], pd.DataFrame):
-        df = args[0]
-    else:
-        logger.info('Reading CSV with `read_csv(*{}, **{})`...'.format(args, kwargs))
-        df = pd.read_csv(*args, **kwargs)
-    if looks_like_index(df[df.columns[0]]):
-        df = df.set_index(df.columns[0], drop=True)
-        if df.index.name in ('Unnamed: 0', ''):
-            df.index.name = None
-    if ((str(df.index.values.dtype).startswith('int') and (df.index.values > 1e9 * 3600 * 24 * 366 * 10).any()) or
-            (str(df.index.values.dtype) == 'object')):
-        try:
-            df.index = pd.to_datetime(df.index)
-        except (ValueError, TypeError, pd.errors.OutOfBoundsDatetime):
-            logger.info('Unable to coerce DataFrame.index into a datetime using pd.to_datetime([{},...])'.format(
-                df.index.values[0]))
-    return df
-
-
 #######################################################################
 # Populate some local string variables with text files from DATA_PATH
 for filename in TEXTS:
@@ -738,161 +685,9 @@ for filename in TEXTS:
 del fin
 
 
-def wc(f, verbose=False, nrows=None):
-    r""" Count lines in a text file
-
-    References:
-        https://stackoverflow.com/q/845058/623735
-
-    >>> with open(os.path.join(DATA_PATH, 'dictionary_fda_drug_names.txt')) as fin:
-    ...     print(wc(fin) == wc(fin) == 7037 == wc(fin.name))
-    True
-    >>> wc(fin.name)
-    7037
-    """
-    tqdm_prog = tqdm if verbose else no_tqdm
-    with ensure_open(f, mode='r') as fin:
-        for i, line in tqdm_prog(enumerate(fin)):
-            if nrows is not None and i >= nrows - 1:
-                break
-        # fin.seek(0)
-        return i + 1
-
-
-def ensure_str(s):
-    r""" Ensure that s is a str and not a bytes (.decode() if necessary)
-
-    >>> ensure_str(b"I'm 2. When I grow up I want to be a str!")
-    "I'm 2. When I grow up I want to be a str!"
-    >>> ensure_str(42)
-    '42'
-    """
-    try:
-        return s.decode()
-    except AttributeError:
-        if isinstance(s, str):
-            return s
-    return repr(s)  # create a python repr (str) of a non-bytes nonstr object
-
-
-def read_text(forfn, nrows=None, verbose=True):
-    r""" Read all the lines (up to nrows) from a text file or txt.gz file
-
-    >>> fn = os.path.join(DATA_PATH, 'mavis-batey-greetings.txt')
-    >>> len(read_text(fn, nrows=3))
-    3
-    """
-    tqdm_prog = tqdm if verbose else no_tqdm
-    nrows = wc(forfn, nrows=nrows)  # not necessary when nrows==None
-    lines = np.empty(dtype=object, shape=nrows)
-    with ensure_open(forfn) as f:
-        for i, line in enumerate(tqdm_prog(f, total=nrows)):
-            if i >= len(lines):
-                break
-            lines[i] = ensure_str(line).rstrip('\n').rstrip('\r')
-        if all('\t' in line for line in lines):
-            num_tabs = [sum([1 for c in line if c == '\t']) for line in lines]
-            del lines
-            if all(i == num_tabs[0] for i in num_tabs):
-                f.seek(0)
-                return read_csv(f, sep='\t', header=None, nrows=nrows)
-        elif sum((1 for line in lines if any((tag.lower() in line.lower() for tag in HTML_TAGS)))
-                ) / float(len(lines)) > .05:
-            return np.array(html2text(EOL.join(lines)).split(EOL))
-    return lines
-
-
-read_txt = read_text
-
-
 for filename in CSVS:
     locals()['df_' + filename.split('.')[0].replace('-', '_')] = read_csv(
         os.path.join(DATA_PATH, filename))
-
-
-def no_tqdm(it, total=1, **kwargs):
-    """ Do-nothing iterable wrapper to subsitute for tqdm when verbose==False """
-    return it
-
-
-def dropbox_basename(url):
-    """ Strip off the dl=0 suffix from dropbox links
-    
-    >>> dropbox_basename('https://www.dropbox.com/s/yviic64qv84x73j/aclImdb_v1.tar.gz?dl=1')
-    'aclImdb_v1.tar.gz'
-    """
-    filename = os.path.basename(url)
-    match = re.findall(r'\?dl=[0-9]$', filename)
-    if match:
-        return filename[:-len(match[0])]
-    return filename
-
-
-def normalize_ext(filepath):
-    """ Convert file extension(s) to normalized form, e.g. '.tgz' -> '.tar.gz'
-
-    Normalized extensions are ordered in reverse order of how they should be processed.
-    Also extensions are ordered in order of decreasing specificity/detail.
-    e.g. zip last, then txt/bin, then model type, then model dimensionality
-
-    .TGZ => .tar.gz
-    .ZIP => .zip
-    .tgz => .tar.gz
-    .bin.gz => .w2v.bin.gz
-    .6B.zip => .6B.glove.txt.zip
-    .27B.zip => .27B.glove.txt.zip
-    .42B.300d.zip => .42B.300d.glove.txt.zip
-    .840B.300d.zip => .840B.300d.glove.txt.zip
-
-    FIXME: Don't do this! Stick with the original file names and let the text loader figure out what it is!
-    TODO: use regexes to be more general (deal with .300D and .42B extensions)
-
-    >>> normalize_ext('glove.42B.300d.zip')
-    'glove.42B.300d.glove.txt.zip'
-    """
-    mapping = tuple(reversed((
-        ('.tgz', '.tar.gz'),
-        ('.bin.gz', '.w2v.bin.gz'),
-        ('.6B.zip', '.6b.glove.txt.zip'),
-        ('.42B.zip', '.42b.glove.txt.zip'),
-        ('.27B.zip', '.27b.glove.txt.zip'),
-        ('.300d.zip', '.300d.glove.txt.zip'),
-    )))
-    if not isinstance(filepath, str):
-        return [normalize_ext(fp) for fp in filepath]
-    if '~' == filepath[0] or '$' in filepath:
-        filepath = expand_filepath(filepath)
-    fplower = filepath.lower()
-    for ext, newext in mapping:
-        r = ext.lower().replace('.', r'\.') + r'$'
-        r = r'^[.]?([^.]*)\.([^.]{1,10})*' + r
-        if re.match(r, fplower) and not fplower.endswith(newext):
-            filepath = filepath[:-len(ext)] + newext
-    return filepath
-
-
-def normalize_filepath(filepath):
-    r""" Lowercase the filename and ext, expanding extensions like .tgz to .tar.gz.
-
-    >>> normalize_filepath('/Hello_World.txt\n')
-    'hello_world.txt'
-    >>> normalize_filepath('NLPIA/src/nlpia/bigdata/Goog New 300Dneg\f.bIn\n.GZ')
-    'NLPIA/src/nlpia/bigdata/goog new 300dneg.bin.gz'
-    """
-    filename = os.path.basename(filepath)
-    dirpath = filepath[:-len(filename)]
-    cre_controlspace = re.compile(r'[\t\r\n\f]+')
-    new_filename = cre_controlspace.sub('', filename)
-    if not new_filename == filename:
-        logger.warning('Stripping whitespace from filename: {} => {}'.format(
-            repr(filename), repr(new_filename)))
-        filename = new_filename
-    filename = filename.lower()
-    filename = normalize_ext(filename)
-    if dirpath:
-        dirpath = dirpath[:-1]  # get rid of the trailing os.path.sep
-        return os.path.join(dirpath, filename)
-    return filename
 
 
 def migrate_big_urls(big_urls=BIG_URLS, inplace=True):
@@ -1004,27 +799,6 @@ def create_big_url(name):
     return name
 
 
-def try_parse_url(url):
-    """ User urlparse to try to parse URL returning None on exception """
-    if len(url.strip()) < 4:
-        logger.info('URL too short: {}'.format(url))
-        return None
-    try:
-        parsed_url = urlparse(url)
-    except ValueError:
-        logger.info('Parse URL ValueError: {}'.format(url))
-        return None
-    if parsed_url.scheme:
-        return parsed_url
-    try:
-        parsed_url = urlparse('http://' + parsed_url.geturl())
-    except ValueError:
-        logger.info('Invalid URL for assumed http scheme: urlparse("{}") from "{}" '.format('http://' + parsed_url.geturl(), url))
-        return None
-    if not parsed_url.scheme:
-        logger.info('Unable to guess a scheme for URL: {}'.format(url))
-        return None
-    return parsed_url
 
 
 def get_ftp_filemeta(parsed_url, username='anonymous', password='nlpia@totalgood.com'):
@@ -1041,75 +815,10 @@ def get_ftp_filemeta(parsed_url, username='anonymous', password='nlpia@totalgood
     ftp.quit()
 
 
-def get_url_filemeta(url):
-    """ Request HTML for the page at the URL indicated and return the url, filename, and remote size
-
-    TODO: just add remote_size and basename and filename attributes to the urlparse object
-          instead of returning a dict
-
-    >>> sorted(get_url_filemeta('mozilla.com').items())
-    [('filename', ''),
-     ('hostname', 'mozilla.com'),
-     ('path', ''),
-     ('remote_size', -1),
-     ('url', 'http://mozilla.com'),
-     ('username', None)]
-    >>> sorted(get_url_filemeta('https://duckduckgo.com/about?q=nlp').items())
-    [('filename', 'about'),
-     ('hostname', 'duckduckgo.com'),
-     ('path', '/about'),
-     ('remote_size', -1),
-     ('url', 'https://duckduckgo.com/about?q=nlp'),
-     ('username', None)]
-    >>> 1000 <= int(get_url_filemeta('en.wikipedia.org')['remote_size']) <= 200000
-    True
-    """
-    parsed_url = try_parse_url(url)
-
-    if parsed_url is None:
-        return None
-    if parsed_url.scheme.startswith('ftp'):
-        return get_ftp_filemeta(parsed_url)
-
-    url = parsed_url.geturl()
-    try:
-        r = requests.get(url, stream=True, allow_redirects=True, timeout=5)
-        remote_size = r.headers.get('Content-Length', -1)
-        return dict(url=url, hostname=parsed_url.hostname, path=parsed_url.path,
-                    username=parsed_url.username, remote_size=remote_size,
-                    filename=os.path.basename(parsed_url.path))
-    except ConnectionError:
-        return None
-    except (InvalidURL, InvalidSchema, InvalidHeader, MissingSchema):
-        return None
-    return None
-
-
-def get_url_title(url):
-    r""" Request HTML for the page at the URL indicated and return it's <title> property
-
-    >>> get_url_title('mozilla.com').strip()
-    'Internet for people, not profit\n    — Mozilla'
-    """
-    parsed_url = try_parse_url(url)
-    if parsed_url is None:
-        return None
-    try:
-        r = requests.get(parsed_url.geturl(), stream=False, allow_redirects=True, timeout=5)
-        tree = parse_html(r.content)
-        title = tree.findtext('.//title')
-        return title
-    except ConnectionError:
-        logging.error('Unable to connect to internet to retrieve URL {}'.format(parsed_url.geturl()))
-        logging.error(format_exc())
-    except (InvalidURL, InvalidSchema, InvalidHeader, MissingSchema):
-        logging.warn('Unable to retrieve URL {}'.format(parsed_url.geturl()))
-        logging.error(format_exc())
-
-
 def download_unzip(names=None, normalize_filenames=False, verbose=True):
     r""" Download CSV or HTML tables listed in `names`, unzip and to DATA_PATH/`names`.csv .txt etc
 
+    TODO: move to web or data_utils or futils
     Also normalizes file name extensions (.bin.gz -> .w2v.bin.gz).
     Uses table in data_info.csv (internal DATA_INFO) to determine URL or file path from dataset name.
     Also looks
@@ -1274,6 +983,14 @@ def read_named_csv(name, data_path=DATA_PATH, nrows=None, verbose=True):
         except (IOError, UnicodeDecodeError):
             pass
     data_path = expand_filepath(data_path)
+    if os.path.isfile(os.path.join(data_path, name)):
+        return read_csv(os.path.join(data_path, name), nrows=nrows)
+    if name in DATASET_NAME2FILENAME:
+        name = DATASET_NAME2FILENAME[name]
+        if name.lower().endswith('.txt') or name.lower().endswith('.txt.gz'):
+            return read_text(os.path.join(data_path, name), nrows=nrows)
+        else:
+            return read_csv(os.path.join(data_path, name), nrows=nrows)
     try:
         return read_csv(os.path.join(data_path, name + '.csv.gz'), nrows=nrows)
     except IOError:
@@ -1379,7 +1096,7 @@ def get_data(name='sms-spam', nrows=None, limit=None):
                 pass
         return filepaths[name]
     elif name in DATASET_NAME2FILENAME:
-        return read_named_csv(name, data_path=DATA_PATH, nrows=nrows)
+        return read_named_csv(name, nrows=nrows)
     elif name in DATA_NAMES:
         return read_named_csv(DATA_NAMES[name], nrows=nrows)
     elif os.path.isfile(name):
@@ -1420,13 +1137,13 @@ def get_wikidata_qnum(wikiarticle, wikisite):
     return list(resp['entities'])[0]
 
 
-DATASET_FILENAMES = [f['name'] for f in find_files(DATA_PATH, '.csv.gz', level=0)]
-DATASET_FILENAMES += [f['name'] for f in find_files(DATA_PATH, '.csv', level=0)]
-DATASET_FILENAMES += [f['name'] for f in find_files(DATA_PATH, '.json', level=0)]
-DATASET_FILENAMES += [f['name'] for f in find_files(DATA_PATH, '.txt', level=0)]
-DATASET_NAMES = sorted(
-    [f[:-4] if f.endswith('.csv') else f for f in [os.path.splitext(f)[0] for f in DATASET_FILENAMES]])
-DATASET_NAME2FILENAME = dict(zip(DATASET_NAMES, DATASET_FILENAMES))
+DATASET_FILENAMES = [f['name'] for f in find_files(DATA_PATH, ext='.csv.gz', level=0)]
+DATASET_FILENAMES += [f['name'] for f in find_files(DATA_PATH, ext='.csv', level=0)]
+DATASET_FILENAMES += [f['name'] for f in find_files(DATA_PATH, ext='.json', level=0)]
+DATASET_FILENAMES += [f['name'] for f in find_files(DATA_PATH, ext='.txt', level=0)]
+DATASET_NAMES =[
+    f[:-4] if f.endswith('.csv') else f for f in [os.path.splitext(f)[0] for f in DATASET_FILENAMES]]
+DATASET_NAME2FILENAME = dict(sorted(zip(DATASET_NAMES, DATASET_FILENAMES)))
 
 
 def str2int(s):
