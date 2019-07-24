@@ -388,3 +388,4 @@ decoder_model = Model(
 ...         thought = [h, c]  # <7>
 
 ...     return generated_sequence
+"""
