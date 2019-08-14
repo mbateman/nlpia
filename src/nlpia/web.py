@@ -14,22 +14,50 @@ from past.builtins import basestring
 
 import os
 import re
+
 import requests
 from requests.exceptions import ConnectionError, InvalidURL, InvalidSchema, InvalidHeader, MissingSchema
-import sys
+import sys  # noqa unused
 from urllib.parse import urlparse
-from urllib.error import URLError
+from urllib.error import URLError  # noqa (not used)
+import ftplib
 
 from lxml.html import fromstring as parse_html
-from tqdm import tqdm
 from pugnlp.regexes import cre_url
 
-from nlpia.constants import logging, tqdm, no_tqdm
-from nlpia.futil import expand_filepath, read_text, read_json
-
-
+from nlpia.constants import logging, tqdm, REQUESTS_HEADER
+from nlpia.constants import no_tqdm  # noqa (not used)
+from nlpia.futil import expand_filepath, read_json
+from nlpia.futil import read_text  # noqa (not used)
 
 logger = logging.getLogger(__name__)
+
+
+def get_ftp_filemeta(parsed_url, username='anonymous', password='nlpia@totalgood.com'):
+    """ FIXME: Get file size, hostname, path metadata from FTP server using parsed_url (urlparse)"""
+    return dict(
+        url=parsed_url.geturl(), hostname=parsed_url.hostname, path=parsed_url.path,
+        username=(parsed_url.username or username),
+        remote_size=-1,
+        filename=os.path.basename(parsed_url.path))
+    ftp = ftplib.FTP(parsed_url.hostname)
+    ftp.login(username, password)
+    ftp.cwd(parsed_url.path)
+    ftp.retrbinary("RETR " + filename, open(filename, 'wb').write)
+    ftp.quit()
+
+
+def requests_get(*args, **kwargs):
+    """ Wrapper for requests.get that set the HTTP header be more acceptable by web servers
+
+    >>> resp = requests_get('https://en.wikipedia.org/wiki/List_of_HTTP_header_fields')
+    >>> resp.content[:10]
+    b'<!DOCTYPE '
+    """
+    headers = dict(REQUESTS_HEADER)
+    headers.update(kwargs.get('headers', None) or {})
+    kwargs['headers'] = headers
+    return requests.get(*args, **kwargs)
 
 
 GOOGLE_DRIVE_PREFIX = 'https://drive.google.com/open?id='
@@ -51,9 +79,10 @@ GOOGLE_DRIVEID_FILENAMES = """
 1a-64b6y6xsQr5puUsHX_wxI1orQDercM VGG_VOC0712Plus_SSD_512x512_ft_iter_160000.h5
 """
 
+
 def http_status_code(code):
     r""" convert 3-digit integer into a short name of the response status code for an HTTP request
-    
+
     >>> http_status_code(301)
     'Moved Permanently'
     >>> http_status_code(302)
@@ -140,7 +169,7 @@ def get_url_filemeta(url):
 
     url = parsed_url.geturl()
     try:
-        r = requests.get(url, stream=True, allow_redirects=True, timeout=5)
+        r = requests_get(url, stream=True, allow_redirects=True, timeout=5)
         remote_size = r.headers.get('Content-Length', -1)
         return dict(url=url, hostname=parsed_url.hostname, path=parsed_url.path,
                     username=parsed_url.username, remote_size=remote_size,
@@ -162,7 +191,7 @@ def get_url_title(url):
     if parsed_url is None:
         return None
     try:
-        r = requests.get(parsed_url.geturl(), stream=False, allow_redirects=True, timeout=5)
+        r = requests_get(parsed_url.geturl(), stream=False, allow_redirects=True, timeout=5)
         tree = parse_html(r.content)
         title = tree.findtext('.//title')
         return title
@@ -222,9 +251,9 @@ def save_response_content(response, filename='data.csv', destination=os.path.cur
 
 
 def download_file_from_google_drive(driveid, filename=None, destination=os.path.curdir):
-    """ Download script for google drive shared links 
+    """ Download script for google drive shared links
 
-    Thank you @turdus-merula and Andrew Hundt! 
+    Thank you @turdus-merula and Andrew Hundt!
     https://stackoverflow.com/a/39225039/623735
     """
     if '&id=' in driveid:
@@ -249,12 +278,12 @@ def download_file_from_google_drive(driveid, filename=None, destination=os.path.
 
     full_destination_path = save_response_content(response, filename=fileanme, destination=destination)
 
-    return os.path.abspath(destination)   
+    return os.path.abspath(destination)
 
 
 def dropbox_basename(url):
     """ Strip off the dl=0 suffix from dropbox links
-    
+
     >>> dropbox_basename('https://www.dropbox.com/s/yviic64qv84x73j/aclImdb_v1.tar.gz?dl=1')
     'aclImdb_v1.tar.gz'
     """

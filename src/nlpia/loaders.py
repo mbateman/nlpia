@@ -47,13 +47,11 @@ from traceback import format_exc
 from zipfile import ZipFile
 from math import ceil
 from itertools import product, zip_longest
-import requests
 from requests.exceptions import ConnectionError, InvalidURL, InvalidSchema, InvalidHeader, MissingSchema
 from urllib.error import URLError
-from copy import deepcopy, copy
+from copy import deepcopy
 
 import pandas as pd
-import gzip
 import tarfile
 import ftplib
 import spacy
@@ -64,13 +62,16 @@ from pugnlp.util import clean_columns
 
 from nlpia.constants import DATA_PATH, BIGDATA_PATH
 from nlpia.constants import DATA_INFO_FILE, BIGDATA_INFO_FILE, BIGDATA_INFO_LATEST
-from nlpia.constants import INT_MIN, INT_NAN, MAX_LEN_FILEPATH, MIN_DATA_FILE_SIZE
-from nlpia.constants import HTML_TAGS, EOL
+from nlpia.constants import INT_MIN, INT_NAN, MIN_DATA_FILE_SIZE
+from nlpia.constants import EOL  # noqa (not used)
 from nlpia.constants import tqdm, no_tqdm
 from nlpia.futil import mkdir_p, path_status, find_files  # from pugnlp.futil
 from nlpia.futil import find_filepath, expand_filepath, normalize_filepath, normalize_ext, ensure_open
 from nlpia.futil import read_json, read_text, read_csv
-from nlpia.web import get_url_filemeta, get_url_title, try_parse_url, dropbox_basename, dropbox_basename
+from nlpia.web import get_url_filemeta
+from nlpia.web import dropbox_basename, get_url_title, try_parse_url  # noqa (not used)
+from nlpia.web import requests_get
+
 
 _parse = None  # placeholder for SpaCy parser + language model
 
@@ -164,10 +165,10 @@ def load_glove(filepath, batch_size=1000, limit=None, verbose=True):
         the .12 .22 .32 .42 ... .42
 
     >>> wv = load_glove(os.path.join(BIGDATA_PATH, 'glove_test.txt'))
-    >>> wv.most_similar('two')[:3]
-    [('three', 0.98...),
-     ('with', 0.89...),
-     ('one', 0.87...)]
+    >>> wv.most_similar('and')[:3]
+    [(',', 0.92...),
+     ('.', 0.91...),
+     ('of', 0.86...)]
     """
     num_dim = isglove(filepath)
     tqdm_prog = tqdm if verbose else no_tqdm
@@ -216,7 +217,9 @@ def load_glove_df(filepath, **kwargs):
     3   -0.41242
     Name: the, dtype: float64
     """
-    return pd.read_table(filepath, index_col=0, header=None, sep=' ')
+    pdkwargs = dict(index_col=0, header=None, sep=r'\s', skiprows=[0], verbose=False, engine='python')
+    pdkwargs.update(kwargs)
+    return pd.read_csv(filepath, **pdkwargs)
 
 
 # def load_glove_format(filepath):
@@ -237,9 +240,16 @@ def get_en2fr(url='http://www.manythings.org/anki/fra-eng.zip'):
 def load_anki_df(language='deu'):
     """ Load into a DataFrame statements in one language along with their translation into English
 
-    >>> get_data('zsm').head(1)
+    >>> df = get_data('zsm')
+    >>> list(df.columns)
+    ['eng', 'zsm']
+    >>> len(df) > 100
+    True
+
+    >> get_data('zsm').head(2)
                     eng                                zsm
     0      Are you new?                         Awak baru?
+    1        Forget it.                        Lupakanlah.
     """
     if os.path.isfile(language):
         filepath = language
@@ -310,7 +320,7 @@ BIG_URLS = {
         'http://www.cs.cornell.edu/~cristian/data/cornell_movie_dialogs_corpus.zip',
         9916637,
         'cornell_movie_dialogs_corpus',
-        
+
     ),
     'save_dialog_tweets': (
         'https://www.dropbox.com/s/tlrr9bm45uzm9yl/save_dialog_tweets.txt.gz?dl=1',
@@ -382,11 +392,11 @@ def generate_big_urls_glove(bigurls=None):
     for num_dim in (50, 100, 200, 300):
         # not all of these dimensionality, and training set size combinations were trained by Stanford
         for suffixes, num_words in zip(
-                                       ('sm -sm _sm -small _small'.split(),
-                                        'med -med _med -medium _medium'.split(),
-                                        'lg -lg _lg -large _large'.split()),
-                                       (6, 42, 840)
-                                      ):
+                ('sm -sm _sm -small _small'.split(),
+                 'med -med _med -medium _medium'.split(),
+                 'lg -lg _lg -large _large'.split()),
+                (6, 42, 840)
+                ):
             for suf in suffixes[:-1]:
                 name = 'glove' + suf + str(num_dim)
                 dirname = 'glove.{num_words}B'.format(num_words=num_words)
@@ -394,7 +404,7 @@ def generate_big_urls_glove(bigurls=None):
                 filename = dirname + '.{num_dim}d.w2v.txt'.format(num_dim=num_dim)
                 # seed the alias named URL with the URL for that training set size's canonical name
                 bigurl_tuple = BIG_URLS['glove' + suffixes[-1]]
-                bigurls[name] =  list(bigurl_tuple[:2])
+                bigurls[name] = list(bigurl_tuple[:2])
                 bigurls[name].append(os.path.join(dirname, filename))
                 bigurls[name].append(load_glove)
                 bigurls[name] = tuple(bigurls[name])
@@ -799,8 +809,6 @@ def create_big_url(name):
     return name
 
 
-
-
 def get_ftp_filemeta(parsed_url, username='anonymous', password='nlpia@totalgood.com'):
     """ FIXME: Get file size, hostname, path metadata from FTP server using parsed_url (urlparse)"""
     return dict(
@@ -906,7 +914,7 @@ def download_file(url, data_path=BIGDATA_PATH, filename=None, size=None, chunk_s
     r = None
     if not remote_size or not stat['type'] == 'file' or not local_size >= remote_size or not stat['size'] > MIN_DATA_FILE_SIZE:
         try:
-            r = requests.get(url, stream=True, allow_redirects=True, timeout=5)
+            r = requests_get(url, stream=True, allow_redirects=True, timeout=5)
             remote_size = r.headers.get('Content-Length', -1)
         except ConnectionError:
             logger.error('ConnectionError for url: {} => request {}'.format(url, r))
@@ -942,7 +950,7 @@ def download_file(url, data_path=BIGDATA_PATH, filename=None, size=None, chunk_s
                     f.write(chunk)
         r.close()
     else:
-        logger.error('Unable to request URL: {} using request object {}'.format(url, r))
+        logger.error(f'Unable to requests.get(url={url}) using request object {r}')
         return None
 
     logger.debug('nlpia.loaders.download_file: bytes={}'.format(bytes_downloaded))
@@ -979,7 +987,7 @@ def read_named_csv(name, data_path=DATA_PATH, nrows=None, verbose=True):
         except (IOError, pd.errors.ParserError):
             pass
         try:
-            return read_txt(name, nrows=nrows)
+            return read_text(name, nrows=nrows)
         except (IOError, UnicodeDecodeError):
             pass
     data_path = expand_filepath(data_path)
@@ -1004,7 +1012,7 @@ def read_named_csv(name, data_path=DATA_PATH, nrows=None, verbose=True):
     except IOError:
         pass
     try:
-        return read_txt(os.path.join(data_path, name + '.txt'), verbose=verbose)
+        return read_text(os.path.join(data_path, name + '.txt'), verbose=verbose)
     except IOError:
         pass
 
@@ -1017,7 +1025,7 @@ def read_named_csv(name, data_path=DATA_PATH, nrows=None, verbose=True):
     except ValueError:
         pass
     try:
-        return read_txt(os.path.join(BIGDATA_PATH, name + '.txt'), verbose=verbose)
+        return read_text(os.path.join(BIGDATA_PATH, name + '.txt'), verbose=verbose)
     except IOError:
         pass
 
@@ -1091,7 +1099,7 @@ def get_data(name='sms-spam', nrows=None, limit=None):
                 pass
         if filepathlow.endswith('.txt'):
             try:
-                return read_txt(filepath)
+                return read_text(filepath)
             except (TypeError, UnicodeError):
                 pass
         return filepaths[name]
@@ -1127,7 +1135,7 @@ def get_wikidata_qnum(wikiarticle, wikisite):
     >>> print(get_wikidata_qnum(wikiarticle="Andromeda Galaxy", wikisite="enwiki"))
     Q2469
     """
-    resp = requests.get('https://www.wikidata.org/w/api.php', timeout=5, params={
+    resp = requests_get('https://www.wikidata.org/w/api.php', timeout=5, params={
         'action': 'wbgetentities',
         'titles': wikiarticle,
         'sites': wikisite,
@@ -1141,7 +1149,7 @@ DATASET_FILENAMES = [f['name'] for f in find_files(DATA_PATH, ext='.csv.gz', lev
 DATASET_FILENAMES += [f['name'] for f in find_files(DATA_PATH, ext='.csv', level=0)]
 DATASET_FILENAMES += [f['name'] for f in find_files(DATA_PATH, ext='.json', level=0)]
 DATASET_FILENAMES += [f['name'] for f in find_files(DATA_PATH, ext='.txt', level=0)]
-DATASET_NAMES =[
+DATASET_NAMES = [
     f[:-4] if f.endswith('.csv') else f for f in [os.path.splitext(f)[0] for f in DATASET_FILENAMES]]
 DATASET_NAME2FILENAME = dict(sorted(zip(DATASET_NAMES, DATASET_FILENAMES)))
 
@@ -1286,9 +1294,10 @@ def load_geo_adwords(filename='AdWords API Location Criteria 2017-06-26.csv.gz')
     df['country'] = cleancanon.country
     return df
 
+
 def clean_cornell_movies(filename='cornell_movie_dialogs_corpus.zip', subdir='cornell movie-dialogs corpus'):
     """ Load a dataframe of ~100k raw (uncollated) movie lines from the cornell movies dialog corpus
-    
+
     >>> local_filepath = download_file(BIG_URLS['cornell_movie_dialogs_corpus'][0])
     >>> df = clean_cornell_movies(filename='cornell_movie_dialogs_corpus.zip')
     >>> df.describe(include='all')
@@ -1303,6 +1312,7 @@ def clean_cornell_movies(filename='cornell_movie_dialogs_corpus.zip', subdir='co
     subdir = 'cornell movie-dialogs corpus'
     if fullpath_zipfile.lower().endswith('.zip'):
         retval = unzip(fullpath_zipfile)
+        logger.debug(f'unzip({fullpath_zipfile}) return value: {retval}')
         dirname = dirname[:-4]
     fullpath_movie_lines = os.path.join(BIGDATA_PATH, dirname, subdir, 'movie_lines.txt')
     dialog = pd.read_csv(
@@ -1314,6 +1324,7 @@ def clean_cornell_movies(filename='cornell_movie_dialogs_corpus.zip', subdir='co
     for col in dialog.columns:
         dialog[col] = dialog[col].str.strip()
     return dialog
+
 
 def isglove(filepath):
     """ Get the first word vector in a GloVE file and return its dimensionality or False if not a vector
